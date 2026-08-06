@@ -475,7 +475,14 @@ impl Engine {
         let joined = |v: Vec<String>| v.join(" ");
 
         Ok(match name {
-            "subst" => g(2).replace(g(0), g(1)),
+            "subst" => {
+                if g(0).is_empty() {
+                    // GNU: an empty search appends the replacement once.
+                    format!("{}{}", g(2), g(1))
+                } else {
+                    g(2).replace(g(0), g(1))
+                }
+            }
             "patsubst" => joined(
                 words(g(2))
                     .iter()
@@ -509,8 +516,14 @@ impl Engine {
             }
             "word" => {
                 let n = self.parse_index(g(0), "word")?;
+                if n == 0 {
+                    return Err(Error::at(
+                        &self.loc,
+                        "first argument to 'word' function must be greater than 0".to_string(),
+                    ));
+                }
                 words(g(1))
-                    .get(n.wrapping_sub(1))
+                    .get(n - 1)
                     .copied()
                     .unwrap_or("")
                     .to_string()
@@ -519,8 +532,14 @@ impl Engine {
             "wordlist" => {
                 let s = self.parse_index(g(0), "wordlist")?;
                 let e = self.parse_index(g(1), "wordlist")?;
+                if s == 0 {
+                    return Err(Error::at(
+                        &self.loc,
+                        format!("invalid first argument to 'wordlist' function: '{s}'"),
+                    ));
+                }
                 let ws = words(g(2));
-                if s == 0 || s > ws.len() || e < s {
+                if s > ws.len() || e < s {
                     String::new()
                 } else {
                     ws[s - 1..e.min(ws.len())].join(" ")

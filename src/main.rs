@@ -7,8 +7,8 @@ usage: rsmake [options] [VAR=value ...] [target ...]
 
   -f FILE     read FILE as the makefile
   -C DIR      change to DIR before reading the makefile
-  -j [N]      run up to N recipes concurrently (default: unlimited is not
-              supported; N must be given or 1 is used)
+  -j N        run up to N recipes concurrently (a bare -j is refused; an
+              unbounded job count is not supported)
   -k          keep going after a failed target
   -n          print recipes without executing them
   -s          do not echo recipes

@@ -257,3 +257,53 @@ fn question_mode_reports_staleness_without_building() {
         r.stdout
     );
 }
+
+#[test]
+fn word_index_zero_is_refused() {
+    // GNU make stops on `$(word 0,...)`; silently returning the empty string
+    // would let a makefile that means to pick a word build nothing instead.
+    let r = run("word0", "all:\n\t@echo '$(word 0,a b)'\n", &["-n"]);
+    assert_refused(&r, "word");
+    assert!(r.stderr.contains("greater than 0"), "{}", r.stderr);
+}
+
+#[test]
+fn wordlist_zero_start_is_refused() {
+    let r = run("wordlist0", "all:\n\t@echo '$(wordlist 0,2,a b c)'\n", &["-n"]);
+    assert_refused(&r, "wordlist");
+    assert!(r.stderr.contains("'0'"), "{}", r.stderr);
+}
+
+#[test]
+fn subst_empty_appends_once() {
+    let r = run("subst-empty", "all:\n\t@echo '$(subst ,X,ab)'\n", &["-n"]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(
+        r.stdout.contains("abX"),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn realpath_resolves_and_requires_existence() {
+    // `realpath` canonicalises only paths that exist; `abspath` is textual so
+    // it works on names that do not yet exist. The scratch dir is deterministic
+    // for this helper, unlike the differential corpus's two private dirs.
+    let r = run(
+        "realpath",
+        "all:\n\t@echo '$(realpath ./Makefile)'\n\t@echo '$(abspath ./missing.o)'\n",
+        &["-n"],
+    );
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(
+        r.stdout.contains("Makefile"),
+        "realpath keeps existing paths: {}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("missing.o"),
+        "abspath resolves non-existent names textually: {}",
+        r.stdout
+    );
+}
