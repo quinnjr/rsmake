@@ -7,3 +7,4 @@ all:
 	echo "[$(filter-out %.c,$(L))]"
 	echo "[$(sort c b a b)]"
 	echo "[$(subst a,b,c,d)]"
+	echo "[$(subst ,X,ab)]"

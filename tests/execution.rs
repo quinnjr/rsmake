@@ -232,3 +232,41 @@ fn parallel_output_is_not_interleaved() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn realpath_canonicalises_existing_abspath_resolves_rest() {
+    // `realpath` resolves only what exists (so it is dry-run compatible with
+    // the differential corpus's private cwds), while `abspath` is textual and
+    // works on names that do not exist yet. Run on a real tree so the paths
+    // are absolute and deterministic.
+    let dir = std::env::temp_dir().join(format!("rsmake-path-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create path dir");
+    std::fs::write(dir.join("real.f"), "x").expect("write fixture");
+    std::fs::write(
+        dir.join("Makefile"),
+        "all:\n\techo '$(realpath ./real.f)'\n\techo '$(abspath ./missing.o)'\n",
+    )
+    .expect("write makefile");
+
+    let (code, log) = build_with(env!("CARGO_BIN_EXE_rsmake"), &dir, &["-n"]);
+    assert_eq!(code, 0, "{log}");
+    // Expanded `-n` output is only the recipe lines, so realpath's absolute
+    // path is embedded in the emitted echo. It must be absolute (start /).
+    assert!(
+        log.contains("real.f"),
+        "realpath must resolve an existing file:\n{log}"
+    );
+    assert!(
+        !log.contains("echo ''"),
+        "realpath of an existing file must not be empty:\n{log}"
+    );
+    assert!(
+        log.lines().any(|l| {
+            l.contains("missing.o") && l.starts_with("echo '/")
+        }),
+        "abspath must resolve a non-existent name to an absolute path:\n{log}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

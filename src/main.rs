@@ -79,9 +79,9 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
                 'f' => o.makefile = take_arg(true)?.map(PathBuf::from),
                 'C' => o.directory = take_arg(true)?.map(PathBuf::from),
                 'j' => {
-                    // `-j` alone is 1, `-j4` and `-j 4` are 4. An unbounded
-                    // `-j` is refused rather than guessed: on a build host it
-                    // is how a makefile takes the machine down.
+                    // `-j4` and `-j 4` are 4; a bare `-j` is refused. An
+                    // unbounded job count is refused rather than guessed: on a
+                    // build host it is how a makefile takes the machine down.
                     let inline = take_arg(false)?;
                     let n = match inline {
                         Some(s) => s

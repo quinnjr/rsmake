@@ -212,3 +212,19 @@ fn unknown_function_names_are_ordinary_variable_references() {
     // referenced a variable whose name contains a space.
     assert_eq!(eval("", "[$(nosuchfn a,b)]"), "[]");
 }
+
+#[test]
+fn subst_empty_search_appends_replacement_once() {
+    // GNU make: `$(subst ,X,ab)` is `abX`, not `XaXbX`. Matching Rust's
+    // `str::replace` on an empty needle would insert at every boundary.
+    assert_eq!(eval("", "$(subst ,X,ab)"), "abX");
+    assert_eq!(eval("", "$(subst ,X,)"), "X");
+    assert_eq!(eval("", "$(subst ,,ab)"), "ab");
+}
+
+#[test]
+fn word_indices_after_the_zero_guard_still_work() {
+    // The `word 0` refusal added a guard; non-zero indices must be unaffected.
+    assert_eq!(eval("", "$(word 1,a b)"), "a");
+    assert_eq!(eval("", "$(word 2,a b)"), "b");
+}

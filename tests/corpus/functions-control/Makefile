@@ -8,4 +8,4 @@ all:
 	echo "[$(call thunk,val)]"
 	echo "[$(or ,,third)] [$(and a,b)] [$(and a,,c)]"
 	echo "[$(origin LIST)] [$(origin NOTSET)] [$(origin CC)]"
-	echo "[$(flavor flavor_defined)] [$(flavor recipe)] [$(flavor never)"
+	echo "[$(flavor flavor_defined)] [$(flavor recipe)] [$(flavor never)]"

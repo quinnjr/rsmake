@@ -273,37 +273,3 @@ fn wordlist_zero_start_is_refused() {
     assert_refused(&r, "wordlist");
     assert!(r.stderr.contains("'0'"), "{}", r.stderr);
 }
-
-#[test]
-fn subst_empty_appends_once() {
-    let r = run("subst-empty", "all:\n\t@echo '$(subst ,X,ab)'\n", &["-n"]);
-    assert_eq!(r.code, 0, "{}", r.stderr);
-    assert!(
-        r.stdout.contains("abX"),
-        "{}",
-        r.stdout
-    );
-}
-
-#[test]
-fn realpath_resolves_and_requires_existence() {
-    // `realpath` canonicalises only paths that exist; `abspath` is textual so
-    // it works on names that do not yet exist. The scratch dir is deterministic
-    // for this helper, unlike the differential corpus's two private dirs.
-    let r = run(
-        "realpath",
-        "all:\n\t@echo '$(realpath ./Makefile)'\n\t@echo '$(abspath ./missing.o)'\n",
-        &["-n"],
-    );
-    assert_eq!(r.code, 0, "{}", r.stderr);
-    assert!(
-        r.stdout.contains("Makefile"),
-        "realpath keeps existing paths: {}",
-        r.stdout
-    );
-    assert!(
-        r.stdout.contains("missing.o"),
-        "abspath resolves non-existent names textually: {}",
-        r.stdout
-    );
-}
