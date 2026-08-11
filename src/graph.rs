@@ -7,8 +7,8 @@
 //! problem, and it means cycle detection happens before any recipe runs.
 
 use crate::expand::pattern_match;
-use crate::{AutoVars, Engine, Error, Flavor, Loc, Origin, Result, TargetVar, Var};
-use std::collections::HashMap;
+use crate::{AutoVars, Engine, Error, Loc, Origin, Result, TargetVar, Var};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -59,38 +59,55 @@ fn mtime_of(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).ok().and_then(|m| m.modified().ok())
 }
 
+/// State shared across one discovery pass (one top-level `discover` call and
+/// all the recursion beneath it): `VPATH` expanded once rather than per
+/// candidate, and a name -> resolved-path memo so a prerequisite referenced
+/// from several rules is only stat'd once. Resolution must not go stale
+/// *within* a build, but the graph is fully discovered before any recipe
+/// runs, so nothing invalidates the cache mid-pass; a fresh pass gets a fresh
+/// cache.
+struct DiscoveryCache {
+    vpath: String,
+    resolved: HashMap<String, PathBuf>,
+}
+
 impl Engine {
     /// Resolve a name to the file it refers to, consulting `vpath` and `VPATH`.
     ///
     /// A name with an explicit rule keeps its own spelling: the rule says where
     /// the file will be, and searching would find a stale copy elsewhere.
-    fn resolve_path(&mut self, name: &str) -> PathBuf {
+    fn resolve_path(&mut self, name: &str, cache: &mut DiscoveryCache) -> PathBuf {
+        if let Some(hit) = cache.resolved.get(name) {
+            return hit.clone();
+        }
         let local = PathBuf::from(name);
-        if local.exists() || self.rules.explicit.contains_key(name) {
-            return local;
-        }
-        let vpath_var = self
-            .var_value("VPATH", &AutoVars::default())
-            .unwrap_or_default();
-        for d in self.rules.search_dirs(name, &vpath_var) {
-            let cand = Path::new(&d).join(name);
-            if cand.exists() {
-                return cand;
+        let resolved = if local.exists() || self.rules.explicit.contains_key(name) {
+            local
+        } else {
+            let mut found = None;
+            for d in self.rules.search_dirs(name, &cache.vpath) {
+                let cand = Path::new(&d).join(name);
+                if cand.exists() {
+                    found = Some(cand);
+                    break;
+                }
             }
-        }
-        local
+            found.unwrap_or(local)
+        };
+        cache.resolved.insert(name.to_string(), resolved.clone());
+        resolved
     }
 
     /// Can `name` be supplied, without committing to building it? Used to
     /// decide whether a pattern rule's prerequisites are satisfiable.
-    fn can_supply(&mut self, name: &str) -> bool {
-        self.rules.explicit.contains_key(name) || self.resolve_path(name).exists()
+    fn can_supply(&mut self, name: &str, cache: &mut DiscoveryCache) -> bool {
+        self.rules.explicit.contains_key(name) || self.resolve_path(name, cache).exists()
     }
 
     /// Choose a pattern rule for `target`. Declaration order wins, and the
     /// built-ins are appended last so a user's own `%.o: %.c` always takes
     /// precedence over the built-in of the same shape.
-    fn match_pattern(&mut self, target: &str) -> Option<(crate::Rule, String)> {
+    fn match_pattern(&mut self, target: &str, cache: &mut DiscoveryCache) -> Option<(crate::Rule, String)> {
         let candidates: Vec<(usize, String)> = self
             .rules
             .patterns
@@ -103,7 +120,7 @@ impl Engine {
             // The stem goes into the `%`, so `%.c` with stem `a` is `a.c`.
             let fill = |p: &String| p.replacen('%', &stem, 1);
             let prereqs: Vec<String> = rule.prereqs.iter().map(fill).collect();
-            if prereqs.iter().all(|p| self.can_supply(p)) {
+            if prereqs.iter().all(|p| self.can_supply(p, cache)) {
                 let mut r = rule;
                 r.prereqs = prereqs;
                 r.order_only = r.order_only.iter().map(fill).collect();
@@ -119,12 +136,36 @@ impl Engine {
     /// full path that closed it. rsmake does not break cycles by dropping an
     /// edge: the resulting build order would be arbitrary and the failure
     /// would move to a different target on the next run.
+    ///
+    /// `VPATH` is expanded exactly once here, up front, rather than once per
+    /// resolution candidate: it's a plain variable, but expanding it can run
+    /// `$(shell ...)`, so re-expanding it repeatedly means re-running that
+    /// side effect repeatedly. Expanding it here, rather than swallowing the
+    /// error at the point of use, is also what lets an `$(error)` or a
+    /// depth/cycle overflow inside VPATH surface as a real error instead of a
+    /// silent empty search path.
     pub fn discover(
         &mut self,
         goal: &str,
         graph: &mut Graph,
         stack: &mut Vec<String>,
         inherited: &[TargetVar],
+    ) -> Result<usize> {
+        let vpath = self.var_value("VPATH", &AutoVars::default())?;
+        let mut cache = DiscoveryCache {
+            vpath,
+            resolved: HashMap::new(),
+        };
+        self.discover_inner(goal, graph, stack, inherited, &mut cache)
+    }
+
+    fn discover_inner(
+        &mut self,
+        goal: &str,
+        graph: &mut Graph,
+        stack: &mut Vec<String>,
+        inherited: &[TargetVar],
+        cache: &mut DiscoveryCache,
     ) -> Result<usize> {
         if let Some(&i) = graph.index.get(goal) {
             if stack.iter().any(|s| s == goal) {
@@ -137,16 +178,8 @@ impl Engine {
             }
             return Ok(i);
         }
-        if stack.iter().any(|s| s == goal) {
-            let mut chain = stack.clone();
-            chain.push(goal.to_string());
-            return Err(Error::new(format!(
-                "dependency cycle: {}",
-                chain.join(" -> ")
-            )));
-        }
 
-        let path = self.resolve_path(goal);
+        let path = self.resolve_path(goal, cache);
         let phony = self.rules.is_phony(goal);
         let mut tvars = inherited.to_vec();
         if let Some(own) = self.rules.target_vars.get(goal) {
@@ -171,7 +204,7 @@ impl Engine {
         let mut instances: Vec<(crate::Rule, String)> = Vec::new();
 
         if explicit.is_empty() {
-            if let Some(hit) = self.match_pattern(goal) {
+            if let Some(hit) = self.match_pattern(goal, cache) {
                 instances.push(hit);
             }
         } else {
@@ -180,12 +213,13 @@ impl Engine {
                 // recipe from a pattern rule; without this, `main.o: defs.h`
                 // alongside the built-in `%.o: %.c` builds nothing.
                 if r.recipe.is_empty()
-                    && let Some((pat, stem)) = self.match_pattern(goal)
+                    && let Some((pat, stem)) = self.match_pattern(goal, cache)
                 {
                     let mut merged = r.clone();
                     merged.recipe = pat.recipe;
+                    let mut seen: HashSet<String> = merged.prereqs.iter().cloned().collect();
                     for p in pat.prereqs {
-                        if !merged.prereqs.contains(&p) {
+                        if seen.insert(p.clone()) {
                             merged.prereqs.push(p);
                         }
                     }
@@ -219,19 +253,19 @@ impl Engine {
             let mut deps = Vec::new();
             let mut names = Vec::new();
             for p in &rule.prereqs {
-                let resolved = self.resolve_path(p).to_string_lossy().into_owned();
+                let resolved = self.resolve_path(p, cache).to_string_lossy().into_owned();
                 let name = if resolved.is_empty() {
                     p.clone()
                 } else {
                     resolved
                 };
-                deps.push(self.discover(&name, graph, stack, &tvars)?);
+                deps.push(self.discover_inner(&name, graph, stack, &tvars, cache)?);
                 names.push(name);
             }
             let mut order_only = Vec::new();
             for p in &rule.order_only {
-                let resolved = self.resolve_path(p).to_string_lossy().into_owned();
-                order_only.push(self.discover(&resolved, graph, stack, &tvars)?);
+                let resolved = self.resolve_path(p, cache).to_string_lossy().into_owned();
+                order_only.push(self.discover_inner(&resolved, graph, stack, &tvars, cache)?);
             }
             entries.push(NodeEntry {
                 deps,
@@ -251,14 +285,20 @@ impl Engine {
     /// the target must be rebuilt at all.
     ///
     /// Equal timestamps mean up to date: a target is stale only when strictly
-    /// older than a prerequisite. A prerequisite dated in the future is a
-    /// clock-skew warning and forces a rebuild, because silently treating it
-    /// as up to date is indistinguishable from a correct build until much later.
+    /// older than a prerequisite. A prerequisite dated in the future counts as
+    /// newer (forcing a rebuild, via the same `p > t` comparison used for any
+    /// other newer prerequisite) and also earns a clock-skew warning, because
+    /// silently treating it as up to date is indistinguishable from a correct
+    /// build until much later. A target whose *own* mtime is in the future is
+    /// only warned about, not force-rebuilt: GNU make does not remake a target
+    /// that is otherwise up to date just because its own timestamp is skewed.
     pub fn staleness(&self, graph: &Graph, idx: usize, entry: usize) -> (bool, Vec<String>) {
         let node = &graph.nodes[idx];
         let e = &node.entries[entry];
         let mut newer = Vec::new();
+        let mut seen_newer: HashSet<String> = HashSet::new();
         let mut stale = self.opts.always_make || node.phony || node.mtime.is_none();
+        let now = SystemTime::now();
 
         for (di, dep) in e.deps.iter().enumerate() {
             let d = &graph.nodes[*dep];
@@ -267,6 +307,17 @@ impl Engine {
                 .get(di)
                 .cloned()
                 .unwrap_or_else(|| d.target.clone());
+            if let Some(p) = d.mtime
+                && p > now
+                // Once per file, not once per dependent: staleness is asked
+                // per edge, and a skewed header included by twenty sources
+                // would otherwise bury the build log in the same line.
+                && self.future_warned.borrow_mut().insert(name.clone())
+            {
+                eprintln!(
+                    "rsmake: warning: `{name}` has a modification time in the future"
+                );
+            }
             let counts = match (node.mtime, d.mtime) {
                 // A target that does not exist is older than everything, so
                 // every prerequisite is "newer" and lands in `$?`. Leaving
@@ -279,20 +330,24 @@ impl Engine {
             };
             if counts {
                 stale = true;
-                if !newer.contains(&name) {
+                if seen_newer.insert(name.clone()) {
                     newer.push(name);
                 }
             }
         }
 
         if let Some(t) = node.mtime
-            && t > SystemTime::now()
+            && t > now
+            // Same once-per-file gate as the prerequisite branch above, and for
+            // the same reason: staleness is asked once per rule entry and again
+            // for every dependent that names this node, so an ungated warning
+            // here repeated itself two or three times per skewed file.
+            && self.future_warned.borrow_mut().insert(node.target.clone())
         {
             eprintln!(
-                "rsmake: warning: `{}` has a modification time in the future; rebuilding",
+                "rsmake: warning: `{}` has a modification time in the future",
                 node.target
             );
-            stale = true;
         }
         (stale, newer)
     }
@@ -302,8 +357,9 @@ impl Engine {
         let node = &graph.nodes[idx];
         let e = &node.entries[entry];
         let mut dedup: Vec<String> = Vec::new();
+        let mut seen: HashSet<&String> = HashSet::new();
         for p in &e.prereq_names {
-            if !dedup.contains(p) {
+            if seen.insert(p) {
                 dedup.push(p.clone());
             }
         }
@@ -341,11 +397,6 @@ impl Engine {
                 tv.value.clone()
             };
             self.vars.force(&tv.name, value, Origin::File);
-            if tv.flavor == Flavor::Recursive
-                && let Some(v) = self.vars.get(&tv.name).cloned()
-            {
-                self.vars.force(&tv.name, v.value, Origin::File);
-            }
         }
         saved
     }
@@ -359,11 +410,15 @@ impl Engine {
     /// The default goal: the first explicit target in file order that is
     /// neither special nor a pattern. Taken from insertion order rather than
     /// the hash map, which would make the default goal an allocation accident.
+    ///
+    /// "Special" means a leading dot *and* no slash: GNU make reserves
+    /// dotted names like `.PHONY` for its own directives, but `./out` or
+    /// `sub/.hidden` are ordinary targets that happen to contain a dot.
     pub fn default_goal(&self) -> Option<String> {
         self.rules
             .order
             .iter()
-            .find(|t| !t.starts_with('.') && !t.contains('%'))
+            .find(|t| !(t.starts_with('.') && !t.contains('/')) && !t.contains('%'))
             .cloned()
     }
 }

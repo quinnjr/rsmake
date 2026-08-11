@@ -88,19 +88,40 @@ fn split_line(s: &str) -> Split {
     Split::None
 }
 
-/// Strip an unescaped `#` comment. `\#` is a literal hash.
+/// Strip an unescaped `#` comment.
+///
+/// The run of backslashes in front of a `#` decides: an odd run escapes it, so
+/// the `#` is literal and the run collapses to half its length; an even run
+/// leaves the `#` starting a comment and still collapses. `V = a\\# c` is
+/// therefore `a\`, not `a\# c` — a rule that only looked at the single
+/// character before the hash would keep the whole line.
 fn strip_comment(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' && chars.peek() == Some(&'#') {
-            out.push('#');
-            chars.next();
-        } else if c == '#' {
-            break;
-        } else {
-            out.push(c);
+    let mut slashes = 0usize;
+    for c in s.chars() {
+        match c {
+            '\\' => slashes += 1,
+            '#' => {
+                for _ in 0..slashes / 2 {
+                    out.push('\\');
+                }
+                if slashes % 2 == 0 {
+                    return out;
+                }
+                slashes = 0;
+                out.push('#');
+            }
+            other => {
+                for _ in 0..slashes {
+                    out.push('\\');
+                }
+                slashes = 0;
+                out.push(other);
+            }
         }
+    }
+    for _ in 0..slashes {
+        out.push('\\');
     }
     out
 }
@@ -157,11 +178,42 @@ const REJECTED_TARGETS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Backstop for the include cycle guard. The guard identifies files by their
+/// canonical path; if `canonicalize` fails — a path that momentarily does not
+/// resolve, a filesystem that refuses it — two names for one file stop looking
+/// equal and the ring is no longer detected. This cap turns that miss into a
+/// named error instead of a stack overflow, which names nothing.
+const MAX_INCLUDE_DEPTH: usize = 200;
+
 impl Engine {
     pub fn parse_file(&mut self, path: &Path) -> Result<()> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
-        self.parse_text(&text, &path.display().to_string())
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if let Some(at) = self.including.iter().position(|p| *p == key) {
+            let mut chain: Vec<String> = self.including[at..]
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            chain.push(key.display().to_string());
+            return Err(Error::at(
+                &self.loc,
+                format!("include cycle: {}", chain.join(" -> ")),
+            ));
+        }
+        if self.including.len() >= MAX_INCLUDE_DEPTH {
+            return Err(Error::at(
+                &self.loc,
+                format!("include nesting deeper than {MAX_INCLUDE_DEPTH} levels"),
+            ));
+        }
+        self.including.push(key);
+        // Popped before the `?`, so an error inside the include unwinds the
+        // stack the same way a success does; leaving the entry behind would
+        // make a later, legitimate include of the same file look like a cycle.
+        let r = self.parse_text(&text, &path.display().to_string());
+        self.including.pop();
+        r
     }
 
     /// Parse makefile text. Re-entrant: `include` and `$(eval)` both land here,
@@ -171,7 +223,11 @@ impl Engine {
         let raw: Vec<&str> = text.split('\n').collect();
         let mut conds: Vec<Cond> = Vec::new();
         let mut pending: Option<Rule> = None;
-        let mut define: Option<(String, Op, Vec<String>, Loc)> = None;
+        // The `bool` is whether the branch holding this `define` is live. A
+        // dead one still has to be captured: its body is arbitrary text, and
+        // letting a line that reads `endif` reach the conditional dispatcher
+        // unbalances the enclosing stack.
+        let mut define: Option<(String, Op, Vec<String>, Loc, bool)> = None;
         let mut i = 0usize;
 
         while i < raw.len() {
@@ -183,13 +239,15 @@ impl Engine {
             };
 
             // A `define` body is captured verbatim; only `endef` ends it.
-            if let Some((name, op, body, loc)) = define.as_mut() {
+            if let Some((name, op, body, loc, live)) = define.as_mut() {
                 if first.trim() == "endef" {
                     let joined = body.join("\n");
-                    let (n, o, l) = (name.clone(), *op, loc.clone());
+                    let (n, o, l, alive) = (name.clone(), *op, loc.clone(), *live);
                     define = None;
-                    self.loc = l;
-                    self.assign(&n, o, &joined)?;
+                    if alive {
+                        self.loc = l;
+                        self.assign(&n, o, &joined)?;
+                    }
                 } else {
                     body.push(first.to_string());
                 }
@@ -228,8 +286,12 @@ impl Engine {
                 continue;
             }
 
-            // Assemble a logical line from backslash continuations.
-            let mut logical = strip_comment(first);
+            // Assemble a logical line from backslash continuations, then strip
+            // the comment from the whole of it. The order matters both ways:
+            // a backslash-newline inside a comment continues the comment, and
+            // a backslash left behind by comment stripping (`a\\#`) is text,
+            // not a request to swallow the next line.
+            let mut logical = first.to_string();
             while continues(&logical) && i + 1 < raw.len() {
                 let keep = logical.len() - 1;
                 logical.truncate(keep);
@@ -240,8 +302,9 @@ impl Engine {
                 logical = trimmed;
                 i += 1;
                 logical.push(' ');
-                logical.push_str(strip_comment(raw[i]).trim_start());
+                logical.push_str(raw[i].trim_start());
             }
+            let logical = strip_comment(&logical);
             let line = logical.trim();
 
             if line.is_empty() {
@@ -315,6 +378,13 @@ impl Engine {
             }
 
             if !executing {
+                // A `define` in a dead branch still captures, so its body
+                // never reaches the dispatcher above. The name is left
+                // unexpanded and the body is discarded at `endef`.
+                if word == "define" {
+                    let rest = line["define".len()..].trim().to_string();
+                    define = Some((rest, Op::Recursive, Vec::new(), self.loc.clone(), false));
+                }
                 i += 1;
                 continue;
             }
@@ -346,7 +416,7 @@ impl Engine {
                         _ => (rest.to_string(), Op::Recursive),
                     };
                     let name = self.expand(&name, &AutoVars::default())?.trim().to_string();
-                    define = Some((name, op, Vec::new(), self.loc.clone()));
+                    define = Some((name, op, Vec::new(), self.loc.clone(), true));
                     i += 1;
                     continue;
                 }
@@ -466,7 +536,7 @@ impl Engine {
             i += 1;
         }
 
-        if let Some((name, _, _, loc)) = define {
+        if let Some((name, _, _, loc, _)) = define {
             return Err(Error::at(
                 &loc,
                 format!("missing `endef` for `define {name}`"),
@@ -650,14 +720,44 @@ impl Engine {
             }
         }
 
+        // An inline recipe (`target: prereqs ; command`) is split off first, so
+        // the assignment probe below only ever looks at the prerequisite text.
+        // Probing the whole line instead made `all: ; @echo "FOO?=bar"` look
+        // like a target-specific `?=` and `all: ; @echo V=x` look like an
+        // assignment with no targets — the recipe's own text is not part of the
+        // rule's grammar.
+        let (prereq_text, inline_recipe) = match rest.find(';') {
+            Some(i) => (&rest[..i], Some(rest[i + 1..].to_string())),
+            None => (rest, None),
+        };
+
         // A target-specific variable: `target: CFLAGS += -g`.
         if let Split::Assign {
             name_end,
             val_start,
             op,
-        } = split_line(rest)
+        } = split_line(prereq_text)
         {
             let name = self.expand(rest[..name_end].trim(), &auto)?;
+            // GNU keeps the existing value for a target-specific `?=`. rsmake's
+            // overlay has no way to express "only if unset" — it is applied
+            // when the target is built, long after the test would have to be
+            // made — so the construct is refused by name rather than silently
+            // behaving like `=`, which would overwrite what GNU preserves.
+            if op == Op::Cond {
+                return Err(Error::at(
+                    &self.loc,
+                    format!(
+                        "target-specific `?=` (`{}: {} ?= ...`) is outside the rsmake dialect; \
+                         guard the assignment with `ifndef` instead",
+                        targets.join(" "),
+                        name.trim()
+                    ),
+                ));
+            }
+            // Deliberately `rest`, not `prereq_text`: once the line is known to
+            // be an assignment there is no inline recipe on it, and GNU keeps a
+            // `;` in the value — `all: V = a;b` gives `V` the value `a;b`.
             let value = rest[val_start..].trim().to_string();
             let (flavor, append) = match op {
                 Op::Simple => (Flavor::Simple, false),
@@ -685,10 +785,6 @@ impl Engine {
         }
 
         // `targets: pattern: prereqs` is a static pattern rule.
-        let (prereq_text, inline_recipe) = match rest.find(';') {
-            Some(i) => (&rest[..i], Some(rest[i + 1..].to_string())),
-            None => (rest, None),
-        };
         if matches!(split_line(prereq_text), Split::RuleColon { .. }) {
             return Err(Error::at(
                 &self.loc,
@@ -708,10 +804,13 @@ impl Engine {
             targets,
             prereqs: normal.split_whitespace().map(str::to_string).collect(),
             order_only: order_only.split_whitespace().map(str::to_string).collect(),
-            recipe: inline_recipe
-                .into_iter()
-                .filter(|s| !s.trim().is_empty())
-                .collect(),
+            // A whitespace-only inline recipe is kept. `foo: ;` is an *empty*
+            // recipe, which is how a makefile says "this target is made by
+            // doing nothing" and suppresses the implicit-rule search;
+            // discarding the line would make it indistinguishable from a rule
+            // with no recipe at all, and the built-in `%.o: %.c` would fire.
+            // The empty line expands to no command, so nothing is run for it.
+            recipe: inline_recipe.into_iter().collect(),
             double_colon: double,
             loc: self.loc.clone(),
         }))
@@ -738,9 +837,20 @@ impl Engine {
                 continue;
             }
             if let Some(pat) = self.as_suffix_rule(&t) {
+                // A suffix rule's prerequisites come from its name, so any
+                // written on the line are dropped. GNU make warns and carries
+                // on; silently dropping them would leave a header dependency
+                // that looks declared and is not.
+                if !rule.prereqs.is_empty() || !rule.order_only.is_empty() {
+                    eprintln!(
+                        "rsmake: {}: warning: ignoring prerequisites on suffix rule definition",
+                        rule.loc
+                    );
+                }
                 let mut r = rule.clone();
                 r.targets = vec![pat.0];
                 r.prereqs = vec![pat.1];
+                r.order_only = Vec::new();
                 self.rules.patterns.push(r);
                 continue;
             }
@@ -780,14 +890,42 @@ impl Engine {
 
     /// Returns `Some` when the target is one rsmake handles specially, so the
     /// caller does not also file it as an ordinary rule.
+    ///
+    /// The `Result` is the reporting channel for the one thing that can go
+    /// wrong here: these targets carry settings, not commands, so a recipe
+    /// attached to one is dropped. `.DEFAULT` is the exception — a recipe is
+    /// the whole content of that rule.
     fn install_special(&mut self, t: &str, rule: &Rule) -> Option<Result<()>> {
         let p = &rule.prereqs;
+        if t != ".DEFAULT" && !rule.recipe.iter().all(|l| l.trim().is_empty()) {
+            const SETTINGS: &[&str] = &[
+                ".PHONY",
+                ".PRECIOUS",
+                ".SILENT",
+                ".IGNORE",
+                ".DELETE_ON_ERROR",
+                ".NOTPARALLEL",
+                ".POSIX",
+                ".SUFFIXES",
+            ];
+            if SETTINGS.contains(&t) {
+                return Some(Err(Error::at(
+                    &rule.loc,
+                    format!(
+                        "`{t}` declares a setting and takes no recipe; \
+                         the recipe here would never run"
+                    ),
+                )));
+            }
+        }
         match t {
             ".PHONY" => self.rules.phony.extend(p.iter().cloned()),
             ".PRECIOUS" => self.rules.precious.extend(p.iter().cloned()),
             ".SILENT" => {
                 if p.is_empty() {
-                    self.opts.silent = true;
+                    // Not `opts.silent`: that is the `-s` flag, and it rides
+                    // down to sub-makes in `MAKEFLAGS`. `.SILENT:` does not.
+                    self.rules.silent_all = true;
                 } else {
                     self.rules.silent_targets.extend(p.iter().cloned());
                 }

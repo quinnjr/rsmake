@@ -1,0 +1,2 @@
+.hidden/out:
+	echo building $@
