@@ -6,7 +6,6 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "A make implementation for GNU-free base systems"
 repository = "https://github.com/quinnjr/rsmake"
-publish = false
 
 [[bin]]
 name = "rsmake"
